@@ -17,6 +17,8 @@ concurrency:
 permissions:
   contents: read
   checks: write
+  # Lets the unit job exchange an OIDC token for Qlty coverage uploads.
+  id-token: write
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
@@ -103,15 +105,47 @@ jobs:
         timeout-minutes: 20
         run: |
           # The runners have four vCPUs, and each Bun test process performs its own concurrent work.
+          # COVERAGE_ARGS is unquoted on purpose: it is either empty or Turbo's `--` plus Bun's flags.
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            GITHUB_ACTIONS=false bun turbo test --concurrency=3
+            GITHUB_ACTIONS=false bun turbo test --concurrency=3 $COVERAGE_ARGS
             exit 0
           fi
-          GITHUB_ACTIONS=false bun turbo test --affected --concurrency=3
+          GITHUB_ACTIONS=false bun turbo test --affected --concurrency=3 $COVERAGE_ARGS
         env:
+          # Only Linux publishes coverage, so only Linux pays for the instrumentation.
+          COVERAGE_ARGS: ${{ runner.os == 'Linux' && '-- --coverage --coverage-reporter=lcov' || '' }}
           OPENCODE_EXPERIMENTAL_DISABLE_FILEWATCHER: ${{ runner.os == 'Windows' && 'true' || 'false' }}
           TURBO_SCM_BASE: ${{ github.event_name == 'pull_request' && format('{0}^1', github.sha) || github.event.before }}
           TURBO_SCM_HEAD: ${{ github.sha }}
+
+      # Each suite runs from its own package directory, so Bun writes `<package>/coverage/lcov.info` with paths
+      # relative to that directory, and a dependency's sources as `../<package>/...`. Prefix each report with its
+      # package, collapse those `..` segments, and concatenate, so every path matches the checkout.
+      - name: Collect coverage
+        id: coverage
+        if: runner.os == 'Linux'
+        run: |
+          shopt -s nullglob
+          mkdir -p coverage
+          : > coverage/lcov.info
+          for report in packages/*/coverage/lcov.info packages/*/*/coverage/lcov.info services/*/coverage/lcov.info; do
+            package="${report%/coverage/lcov.info}"
+            sed -E "/^SF:/{
+              s@^SF:([^/])@SF:$package/\1@
+              s@/[^/]+/\.\./@/@g
+              s@/[^/]+/\.\./@/@g
+            }" "$report" >> coverage/lcov.info
+          done
+          if [ -s coverage/lcov.info ]; then echo "found=true" >> "$GITHUB_OUTPUT"; fi
+
+      # Turbo runs only the affected packages, so a run without any of them has nothing to publish.
+      # Pull requests from forks get no OIDC token, so they skip the upload too.
+      - name: Upload coverage to Qlty
+        if: ${{ steps.coverage.outputs.found == 'true' && !github.event.pull_request.head.repo.fork }}
+        uses: qltysh/qlty-action/coverage@v2
+        with:
+          oidc: true
+          files: coverage/lcov.info
 
       - name: Verify published codemode package
         if: runner.os == 'Linux'
