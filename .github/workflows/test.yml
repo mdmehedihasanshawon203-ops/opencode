@@ -17,6 +17,8 @@ concurrency:
 permissions:
   contents: read
   checks: write
+  # The unit job authenticates its coverage upload to Qlty with OIDC instead of a secret.
+  id-token: write
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
@@ -103,15 +105,53 @@ jobs:
         timeout-minutes: 20
         run: |
           # The runners have four vCPUs, and each Bun test process performs its own concurrent work.
+          # Turbo forwards the flags after `--` to every test script, so each package writes its own
+          # coverage/lcov.info for the Qlty upload below.
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            GITHUB_ACTIONS=false bun turbo test --concurrency=3
+            GITHUB_ACTIONS=false bun turbo test --concurrency=3 -- --coverage --coverage-reporter=lcov
             exit 0
           fi
-          GITHUB_ACTIONS=false bun turbo test --affected --concurrency=3
+          GITHUB_ACTIONS=false bun turbo test --affected --concurrency=3 -- --coverage --coverage-reporter=lcov
         env:
           OPENCODE_EXPERIMENTAL_DISABLE_FILEWATCHER: ${{ runner.os == 'Windows' && 'true' || 'false' }}
           TURBO_SCM_BASE: ${{ github.event_name == 'pull_request' && format('{0}^1', github.sha) || github.event.before }}
           TURBO_SCM_HEAD: ${{ github.sha }}
+
+      # Every suite runs in its own package directory, so Bun records paths relative to that directory.
+      # One report with repository-relative paths covers whichever packages turbo ran, and needs no list
+      # of packages to keep in sync.
+      - name: Collect coverage reports
+        id: coverage
+        run: |
+          mkdir -p coverage
+          : > coverage/lcov.info
+          found=false
+          for report in packages/*/coverage/lcov.info packages/*/*/coverage/lcov.info services/*/coverage/lcov.info; do
+            [ -f "$report" ] || continue
+            package=${report%/coverage/lcov.info}
+            # Normalize the separators the Windows leg can write, then prefix the package directory
+            # unless the path already carries it.
+            sed -e "/^SF:/s|\\\\|/|g" \
+              -e "s|^SF:\./|SF:|" \
+              -e "\\%^SF:$package/%b" \
+              -e "s|^SF:|SF:$package/|" \
+              "$report" >> coverage/lcov.info
+            found=true
+          done
+          echo "found=$found" >> "$GITHUB_OUTPUT"
+
+      - name: Publish coverage to Qlty
+        # A pull request from a fork gets no OIDC token, and a run with no affected suite has nothing to send.
+        if: ${{ steps.coverage.outputs.found == 'true' && !github.event.pull_request.head.repo.fork }}
+        uses: qltysh/qlty-action/coverage@v2
+        with:
+          oidc: true
+          files: coverage/lcov.info
+          # One part per leg of the matrix above; both legs must upload before Qlty merges the commit.
+          total-parts-count: 2
+          # Only workflow_dispatch runs every suite. Affected-only runs count towards diff coverage,
+          # not towards the project's total.
+          selected: ${{ github.event_name != 'workflow_dispatch' }}
 
       - name: Verify published codemode package
         if: runner.os == 'Linux'
