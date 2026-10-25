@@ -14,6 +14,7 @@ dist
 dist-node
 ts-dist
 .turbo
+coverage
 .typecheck-profiles
 **/.serena
 .serena/
